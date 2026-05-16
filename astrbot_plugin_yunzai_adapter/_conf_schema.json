@@ -1,0 +1,19 @@
+{
+    "WS_HOST": {
+        "description": "Yunzai WebSocket 服务器地址",
+        "type": "string",
+        "default": "127.0.0.1"
+    },
+    "WS_PORT": {
+        "description": "Yunzai WebSocket 服务器端口",
+        "type": "int",
+        "default": 8766,
+        "hint": "与 Yunzai 端 ASTRBOT_WS_PORT 环境变量一致"
+    },
+    "YUNZAI_ONLY_PREFIXES": {
+        "description": "只转发给 Yunzai 处理的消息前缀列表，为空则转发所有",
+        "type": "list",
+        "default": [],
+        "hint": "例如 ["#", "*"] 表示只有 # 或 * 开头的消息才转发给 Yunzai"
+    }
+}

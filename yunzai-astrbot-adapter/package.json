@@ -1,0 +1,9 @@
+{
+    "name": "yunzai-astrbot-adapter",
+    "version": "1.0.0",
+    "description": "Yunzai 与 AstrBot 的桥接适配器，通过 WebSocket 双向通信",
+    "type": "module",
+    "dependencies": {
+        "ws": "^8.18.2"
+    }
+}
