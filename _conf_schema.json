@@ -14,6 +14,6 @@
         "description": "只转发给 Yunzai 处理的消息前缀列表，为空则转发所有",
         "type": "list",
         "default": [],
-        "hint": "例如 ["#", "*"] 表示只有 # 或 * 开头的消息才转发给 Yunzai"
+        "hint": "例如 [#, *] 表示只有 # 或 * 开头的消息才转发给 Yunzai"
     }
 }
