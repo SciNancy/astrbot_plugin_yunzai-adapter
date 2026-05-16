@@ -2,4 +2,4 @@ name: astrbot_plugin_yunzai_adapter
 author: User
 desc: 将 Miao-Yunzai + miao-plugin 桥接到 AstrBot，由 AstrBot 负责通信，Yunzai 处理业务逻辑
 version: 1.0.0
-repo: https://github.com/User/astrbot-plugin-yunzai-adapter
+repo: https://github.com/SciNancy/astrbot_plugin_yunzai_adapter
