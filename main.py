@@ -3,6 +3,7 @@ import base64
 import json
 from pathlib import Path
 
+import msgspec
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
@@ -121,7 +122,7 @@ class YunzaiAdapter(Star):
         )
 
         try:
-            await self.ws.send(json.dumps(payload.__dict__, ensure_ascii=False))
+            await self.ws.send(msgspec.json.encode(payload).decode("utf-8"))
             logger.info(f"[YunzaiAdapter] 转发消息: {event.message_str[:50]}")
         except Exception as e:
             logger.error(f"[YunzaiAdapter] 发送消息失败: {e}")
