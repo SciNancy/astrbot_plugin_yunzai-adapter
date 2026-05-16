@@ -1,20 +1,9 @@
-# 外部依赖源码（不应提交到本仓库）
-Sources/
-
 # 开发工具缓存
 .claude/
 .ruff_cache/
 __pycache__/
 *.pyc
 *.pyo
-
-# 测试文件
-test_*.py
-test_*.js
-
-# Docker 运行时数据（用户本地配置，不应提交）
-Docker/data/
-Docker/yunzai/config/
 
 # IDE
 .vscode/
