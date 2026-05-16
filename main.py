@@ -42,6 +42,10 @@ class YunzaiAdapter(Star):
         ]
         self.ws = None
         self.recv_task = None
+        # WebChat 同步等待用：msg_id -> asyncio.Future
+        self.pending_futures = {}
+        # QQ 等异步平台用：msg_id -> AstrMessageEvent
+        self.pending_events = {}
 
     def _is_yunzai_only_message(self, event: AstrMessageEvent) -> bool:
         """检查消息是否只应由 Yunzai 处理"""
@@ -109,7 +113,8 @@ class YunzaiAdapter(Star):
         user_id = str(event.get_sender_id() or "")
         group_id = str(event.get_group_id() or "") if is_group else None
 
-        # 构造 Yunzai 消息
+        # 构造 Yunzai 消息，msg_id 用于路由回复
+        msg_id = event.get_session_id() or f"{user_id}_{int(asyncio.get_event_loop().time() * 1000)}"
         payload = MessageReceive(
             type="message",
             bot_self_id=self_id,
@@ -118,7 +123,7 @@ class YunzaiAdapter(Star):
             group_id=group_id,
             sender=sender,
             message=yunzai_messages,
-            msg_id=event.get_session_id() or f"{user_id}_{int(asyncio.get_event_loop().time() * 1000)}",
+            msg_id=msg_id,
         )
 
         try:
@@ -127,6 +132,23 @@ class YunzaiAdapter(Star):
         except Exception as e:
             logger.error(f"[YunzaiAdapter] 发送消息失败: {e}")
             return
+
+        # 平台差异化处理：WebChat 需同步等待，QQ 等异步回调
+        is_webchat = event.get_platform_name() == "webchat"
+        if is_webchat:
+            future = asyncio.get_event_loop().create_future()
+            self.pending_futures[msg_id] = future
+            try:
+                reply_chain = await asyncio.wait_for(future, timeout=30)
+                await event.send(reply_chain)
+            except asyncio.TimeoutError:
+                logger.warning("[YunzaiAdapter] WebChat 等待回复超时")
+                await event.send(MessageChain([Plain("Yunzai 处理超时")]))
+            finally:
+                self.pending_futures.pop(msg_id, None)
+        else:
+            # QQ 等平台：保存 event，异步回复时通过 event.send() 发送
+            self.pending_events[msg_id] = event
 
         # 如果配置了独占前缀，阻断 AstrBot 后续处理
         if self._is_yunzai_only_message(event):
@@ -168,29 +190,54 @@ class YunzaiAdapter(Star):
             logger.debug("[YunzaiAdapter] 收到空回复，跳过")
             return
 
-        target_type = data.get("target_type", "private")
+        msg_id = data.get("msg_id")
         target_id = data.get("target_id")
-        bot_self_id = data.get("bot_self_id", "")
 
-        if not target_id:
-            logger.warning("[YunzaiAdapter] 回复缺少 target_id")
+        # 1) 优先尝试 WebChat 的同步 Future
+        future = self.pending_futures.pop(msg_id, None) if msg_id else None
+        if future and not future.done():
+            astrbot_chain = MessageChain()
+            astrbot_msgs = await self._convert_from_yunzai_msgs(content)
+            astrbot_chain.chain.extend(astrbot_msgs)
+            future.set_result(astrbot_chain)
+            logger.info(f"[YunzaiAdapter] 回复已路由到 WebChat Future: {len(astrbot_msgs)} 条消息")
             return
 
-        # 构造 AstrBot 会话对象
+        # 2) 再尝试 QQ 等平台的异步 Event
+        event = self.pending_events.pop(msg_id, None) if msg_id else None
+        if event:
+            astrbot_chain = MessageChain()
+            astrbot_msgs = await self._convert_from_yunzai_msgs(content)
+            astrbot_chain.chain.extend(astrbot_msgs)
+            try:
+                await event.send(astrbot_chain)
+                logger.info(f"[YunzaiAdapter] 回复已通过 event.send 发送: {len(astrbot_msgs)} 条消息")
+            except Exception as e:
+                logger.error(f"[YunzaiAdapter] event.send 失败: {e}")
+            return
+
+        # 3) 兜底：未找到对应的等待上下文，尝试 context.send_message
+        logger.warning(f"[YunzaiAdapter] 未找到 msg_id={msg_id} 的等待上下文，尝试兜底发送")
+        target_type = data.get("target_type", "private")
+        bot_self_id = data.get("bot_self_id", "")
+        if not target_id:
+            logger.warning("[YunzaiAdapter] 回复缺少 target_id，无法兜底发送")
+            return
+
         msg_type_enum = (
             MessageType.GROUP_MESSAGE
             if target_type == "group"
             else MessageType.FRIEND_MESSAGE
         )
         session = MessageSesion(bot_self_id, msg_type_enum, target_id)
-
-        # 转换消息为 AstrBot 格式
         astrbot_chain = MessageChain()
         astrbot_msgs = await self._convert_from_yunzai_msgs(content)
         astrbot_chain.chain.extend(astrbot_msgs)
-
-        logger.info(f"[YunzaiAdapter] 接收回复，即将发送: {len(astrbot_msgs)} 条消息")
-        await self.context.send_message(session, astrbot_chain)
+        try:
+            await self.context.send_message(session, astrbot_chain)
+            logger.info(f"[YunzaiAdapter] 兜底发送成功: {len(astrbot_msgs)} 条消息")
+        except Exception as e:
+            logger.error(f"[YunzaiAdapter] 兜底发送失败: {e}")
 
     async def _convert_to_yunzai_msgs(self, event: AstrMessageEvent) -> list:
         """AstrBot 消息链 → Yunzai 消息格式"""
