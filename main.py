@@ -46,6 +46,8 @@ class YunzaiAdapter(Star):
         self.pending_futures = {}
         # QQ 等异步平台用：msg_id -> AstrMessageEvent
         self.pending_events = {}
+        # 消息去重：防止 AstrBot 事件总线重复触发同一条消息
+        self.processing_ids = set()
 
     def _is_yunzai_only_message(self, event: AstrMessageEvent) -> bool:
         """检查消息是否只应由 Yunzai 处理"""
@@ -115,6 +117,13 @@ class YunzaiAdapter(Star):
 
         # 构造 Yunzai 消息，msg_id 用于路由回复
         msg_id = event.get_session_id() or f"{user_id}_{int(asyncio.get_event_loop().time() * 1000)}"
+
+        # 防抖：同一条消息在短时间内重复触发时跳过
+        if msg_id in self.processing_ids:
+            logger.debug(f"[YunzaiAdapter] 消息 {msg_id} 正在处理中，跳过重复触发")
+            return
+        self.processing_ids.add(msg_id)
+
         payload = MessageReceive(
             type="message",
             bot_self_id=self_id,
@@ -131,24 +140,29 @@ class YunzaiAdapter(Star):
             logger.info(f"[YunzaiAdapter] 转发消息: {event.message_str[:50]}")
         except Exception as e:
             logger.error(f"[YunzaiAdapter] 发送消息失败: {e}")
+            self.processing_ids.discard(msg_id)
             return
 
         # 平台差异化处理：WebChat 需同步等待，QQ 等异步回调
-        is_webchat = event.get_platform_name() == "webchat"
-        if is_webchat:
-            future = asyncio.get_event_loop().create_future()
-            self.pending_futures[msg_id] = future
-            try:
-                reply_chain = await asyncio.wait_for(future, timeout=30)
-                await event.send(reply_chain)
-            except asyncio.TimeoutError:
-                logger.warning("[YunzaiAdapter] WebChat 等待回复超时")
-                await event.send(MessageChain([Plain("Yunzai 处理超时")]))
-            finally:
-                self.pending_futures.pop(msg_id, None)
-        else:
-            # QQ 等平台：保存 event，异步回复时通过 event.send() 发送
-            self.pending_events[msg_id] = event
+        try:
+            is_webchat = event.get_platform_name() == "webchat"
+            if is_webchat:
+                future = asyncio.get_event_loop().create_future()
+                self.pending_futures[msg_id] = future
+                try:
+                    reply_chain = await asyncio.wait_for(future, timeout=30)
+                    await event.send(reply_chain)
+                except asyncio.TimeoutError:
+                    logger.warning("[YunzaiAdapter] WebChat 等待回复超时")
+                    await event.send(MessageChain([Plain("Yunzai 处理超时")]))
+                finally:
+                    self.pending_futures.pop(msg_id, None)
+            else:
+                # QQ 等平台：保存 event，异步回复时通过 event.send() 发送
+                self.pending_events[msg_id] = event
+        finally:
+            # 无论哪种平台，on_all_message 执行完毕后移除防抖标记
+            self.processing_ids.discard(msg_id)
 
         # 如果配置了独占前缀，阻断 AstrBot 后续处理
         if self._is_yunzai_only_message(event):
