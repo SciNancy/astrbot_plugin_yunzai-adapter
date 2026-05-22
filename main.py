@@ -1,9 +1,9 @@
 import asyncio
 import base64
 import json
+from dataclasses import asdict
 from pathlib import Path
 
-import msgspec
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
@@ -29,25 +29,40 @@ from .models import MessageReceive, MessageSend
 class YunzaiAdapter(Star):
     """Yunzai 适配器主类"""
 
-    def __init__(self, context: Context, config: AstrBotConfig):
+    def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
-        self.config = config
+        # 兼容旧版 AstrBot 插件 API（部分版本只传 context）
+        self.config = config or getattr(context, "config", None)
+        # 如果 config 仍未获取到，尝试从配置文件直接读取
+        if not self.config:
+            try:
+                cfg_path = Path("/AstrBot/data/config/astrbot_plugin_yunzai_adapter_config.json")
+                if cfg_path.exists():
+                    with open(cfg_path, "r", encoding="utf-8") as f:
+                        self.config = json.load(f)
+            except Exception:
+                pass
         self.is_connect = False
-        self.ws_host = getattr(self.config, "WS_HOST", "127.0.0.1")
-        self.ws_port = getattr(self.config, "WS_PORT", 8766)
+        # 安全读取配置，兼容 config 为 dict（文件读取）或对象（API传递）的情况
+        def _get(key: str, default):
+            if isinstance(self.config, dict):
+                return self.config.get(key, default)
+            return getattr(self.config, key, default) if self.config else default
+
+        self.ws_host = _get("WS_HOST", "127.0.0.1")
+        self.ws_port = _get("WS_PORT", 8766)
+        prefixes = _get("YUNZAI_ONLY_PREFIXES", [])
         self.yunzai_only_prefixes = [
-            prefix
-            for prefix in getattr(self.config, "YUNZAI_ONLY_PREFIXES", [])
+            prefix for prefix in (prefixes or [])
             if isinstance(prefix, str) and prefix
         ]
+        self.yunzai_root = (_get("YUNZAI_ROOT", "") or "")
         self.ws = None
         self.recv_task = None
-        # WebChat 同步等待用：msg_id -> asyncio.Future
-        self.pending_futures = {}
-        # QQ 等异步平台用：msg_id -> AstrMessageEvent
-        self.pending_events = {}
-        # 消息去重：防止 AstrBot 事件总线重复触发同一条消息
-        self.processing_ids = set()
+        # 保存等待 Yunzai 回复的原始事件对象（QQ 等持久会话平台异步回复用）
+        self.pending_events: dict[str, AstrMessageEvent] = {}
+        # WebChat 等平台需要同步等待回复，用 Future 跨协程传递结果
+        self.pending_futures: dict[str, asyncio.Future] = {}
 
     def _is_yunzai_only_message(self, event: AstrMessageEvent) -> bool:
         """检查消息是否只应由 Yunzai 处理"""
@@ -57,6 +72,10 @@ class YunzaiAdapter(Star):
         if not raw_text:
             return False
         return any(raw_text.startswith(prefix) for prefix in self.yunzai_only_prefixes)
+
+    def _safe_pop_pending(self, key: str):
+        """安全地从 pending_events 中移除指定 key，用于延迟清理"""
+        self.pending_events.pop(key, None)
 
     async def connect(self):
         """建立与 Yunzai 的 WebSocket 连接"""
@@ -93,6 +112,12 @@ class YunzaiAdapter(Star):
             logger.warning("[YunzaiAdapter] WebSocket 未连接，消息未转发")
             return
 
+        # 只转发以配置前缀开头的消息给 Yunzai，其他消息直接跳过
+        # 避免所有消息都涌向 Yunzai 导致重复回复和无关指令被处理
+        if not self._is_yunzai_only_message(event):
+            logger.debug(f"[YunzaiAdapter] 消息未命中前缀，跳过转发: {event.message_str[:30]}")
+            return
+
         # 转换消息链为 Yunzai 格式
         yunzai_messages = await self._convert_to_yunzai_msgs(event)
         if not yunzai_messages:
@@ -115,15 +140,7 @@ class YunzaiAdapter(Star):
         user_id = str(event.get_sender_id() or "")
         group_id = str(event.get_group_id() or "") if is_group else None
 
-        # 构造 Yunzai 消息，msg_id 用于路由回复
-        msg_id = event.get_session_id() or f"{user_id}_{int(asyncio.get_event_loop().time() * 1000)}"
-
-        # 防抖：同一条消息在短时间内重复触发时跳过
-        if msg_id in self.processing_ids:
-            logger.debug(f"[YunzaiAdapter] 消息 {msg_id} 正在处理中，跳过重复触发")
-            return
-        self.processing_ids.add(msg_id)
-
+        # 构造 Yunzai 消息
         payload = MessageReceive(
             type="message",
             bot_self_id=self_id,
@@ -132,39 +149,50 @@ class YunzaiAdapter(Star):
             group_id=group_id,
             sender=sender,
             message=yunzai_messages,
-            msg_id=msg_id,
+            msg_id=event.get_session_id() or f"{user_id}_{int(asyncio.get_event_loop().time() * 1000)}",
         )
 
         try:
-            await self.ws.send(msgspec.json.encode(payload).decode("utf-8"))
+            # 手动构造字典，避免 asdict() 对嵌套 dataclass 的类型敏感问题
+            payload_dict = {
+                "type": payload.type,
+                "bot_self_id": payload.bot_self_id,
+                "message_type": payload.message_type,
+                "user_id": payload.user_id,
+                "group_id": payload.group_id,
+                "sender": payload.sender,
+                "message": [{"type": m.type, "data": m.data} for m in payload.message],
+                "msg_id": payload.msg_id,
+            }
+            await self.ws.send(json.dumps(payload_dict, ensure_ascii=False))
             logger.info(f"[YunzaiAdapter] 转发消息: {event.message_str[:50]}")
         except Exception as e:
             logger.error(f"[YunzaiAdapter] 发送消息失败: {e}")
-            self.processing_ids.discard(msg_id)
             return
 
-        # 平台差异化处理：WebChat 需同步等待，QQ 等异步回调
-        try:
-            is_webchat = event.get_platform_name() == "webchat"
-            if is_webchat:
-                future = asyncio.get_event_loop().create_future()
-                self.pending_futures[msg_id] = future
-                try:
-                    reply_chain = await asyncio.wait_for(future, timeout=30)
-                    await event.send(reply_chain)
-                except asyncio.TimeoutError:
-                    logger.warning("[YunzaiAdapter] WebChat 等待回复超时")
-                    await event.send(MessageChain([Plain("Yunzai 处理超时")]))
-                finally:
-                    self.pending_futures.pop(msg_id, None)
-            else:
-                # QQ 等平台：保存 event，异步回复时通过 event.send() 发送
-                self.pending_events[msg_id] = event
-        finally:
-            # 无论哪种平台，on_all_message 执行完毕后移除防抖标记
-            self.processing_ids.discard(msg_id)
+        # 判断平台：WebChat 必须同步等待回复，因为 HTTP 响应结束后无法异步发送
+        is_webchat = event.get_platform_name() == "webchat"
 
-        # 如果配置了独占前缀，阻断 AstrBot 后续处理
+        if is_webchat:
+            # WebChat：同步等待 Yunzai 回复，在同一 HTTP 请求内返回
+            future = asyncio.get_event_loop().create_future()
+            self.pending_futures[payload.msg_id] = future
+            try:
+                reply_chain = await asyncio.wait_for(future, timeout=30)
+                await event.send(reply_chain)
+                logger.info("[YunzaiAdapter] WebChat 同步回复已发送")
+            except asyncio.TimeoutError:
+                logger.warning("[YunzaiAdapter] WebChat 等待 Yunzai 回复超时")
+            except Exception as e:
+                logger.error(f"[YunzaiAdapter] WebChat 发送同步回复失败: {e}")
+            finally:
+                self.pending_futures.pop(payload.msg_id, None)
+        else:
+            # QQ 等持久会话平台：保存事件，异步等待回复
+            self.pending_events[payload.msg_id] = event
+            self.pending_events[user_id] = event
+
+        # 独占前缀消息阻断 AstrBot 后续处理（LLM 等）
         if self._is_yunzai_only_message(event):
             event.stop_event()
             logger.info("[YunzaiAdapter] 消息命中独占前缀，已阻断 AstrBot 后续流程")
@@ -204,54 +232,57 @@ class YunzaiAdapter(Star):
             logger.debug("[YunzaiAdapter] 收到空回复，跳过")
             return
 
-        msg_id = data.get("msg_id")
+        target_type = data.get("target_type", "private")
         target_id = data.get("target_id")
+        bot_self_id = data.get("bot_self_id", "")
+        msg_id = data.get("msg_id")
 
-        # 1) 优先尝试 WebChat 的同步 Future
+        if not target_id:
+            logger.warning("[YunzaiAdapter] 回复缺少 target_id")
+            return
+
+        # 转换消息为 AstrBot 格式
+        astrbot_chain = MessageChain()
+        astrbot_msgs = await self._convert_from_yunzai_msgs(content)
+        astrbot_chain.chain.extend(astrbot_msgs)
+
+        # 1) WebChat 同步等待模式：通过 Future 传递结果
         future = self.pending_futures.pop(msg_id, None) if msg_id else None
         if future and not future.done():
-            astrbot_chain = MessageChain()
-            astrbot_msgs = await self._convert_from_yunzai_msgs(content)
-            astrbot_chain.chain.extend(astrbot_msgs)
             future.set_result(astrbot_chain)
-            logger.info(f"[YunzaiAdapter] 回复已路由到 WebChat Future: {len(astrbot_msgs)} 条消息")
+            logger.info(f"[YunzaiAdapter] 回复已写入 Future（WebChat 同步等待）: {len(astrbot_msgs)} 条消息")
             return
 
-        # 2) 再尝试 QQ 等平台的异步 Event
-        event = self.pending_events.pop(msg_id, None) if msg_id else None
+        # 2) QQ 等持久会话平台：通过保存的 event 异步发送
+        event = None
+        if msg_id and msg_id in self.pending_events:
+            # msg_id 匹配时不立即 pop，允许同一消息的多条回复（如签到中的"签到中..."+图片+撤回）
+            event = self.pending_events[msg_id]
+        elif target_id in self.pending_events:
+            event = self.pending_events.pop(target_id)
+
         if event:
-            astrbot_chain = MessageChain()
-            astrbot_msgs = await self._convert_from_yunzai_msgs(content)
-            astrbot_chain.chain.extend(astrbot_msgs)
+            logger.info(f"[YunzaiAdapter] 通过 event.send() 发送回复: {len(astrbot_msgs)} 条消息")
             try:
                 await event.send(astrbot_chain)
-                logger.info(f"[YunzaiAdapter] 回复已通过 event.send 发送: {len(astrbot_msgs)} 条消息")
             except Exception as e:
-                logger.error(f"[YunzaiAdapter] event.send 失败: {e}")
+                logger.error(f"[YunzaiAdapter] event.send() 失败: {e}")
+            # 只清理 target_id，msg_id 延迟清理以支持后续回复
+            self.pending_events.pop(target_id, None)
+            if msg_id and msg_id in self.pending_events:
+                # 延迟 60 秒后清理 msg_id，给 Yunzai 的多条回复留时间窗口
+                asyncio.get_event_loop().call_later(60, self._safe_pop_pending, msg_id)
             return
 
-        # 3) 兜底：未找到对应的等待上下文，尝试 context.send_message
-        logger.warning(f"[YunzaiAdapter] 未找到 msg_id={msg_id} 的等待上下文，尝试兜底发送")
-        target_type = data.get("target_type", "private")
-        bot_self_id = data.get("bot_self_id", "")
-        if not target_id:
-            logger.warning("[YunzaiAdapter] 回复缺少 target_id，无法兜底发送")
-            return
-
+        # 3) Fallback: 通过 MessageSesion 发送（适用于其他持久会话平台）
         msg_type_enum = (
             MessageType.GROUP_MESSAGE
             if target_type == "group"
             else MessageType.FRIEND_MESSAGE
         )
         session = MessageSesion(bot_self_id, msg_type_enum, target_id)
-        astrbot_chain = MessageChain()
-        astrbot_msgs = await self._convert_from_yunzai_msgs(content)
-        astrbot_chain.chain.extend(astrbot_msgs)
-        try:
-            await self.context.send_message(session, astrbot_chain)
-            logger.info(f"[YunzaiAdapter] 兜底发送成功: {len(astrbot_msgs)} 条消息")
-        except Exception as e:
-            logger.error(f"[YunzaiAdapter] 兜底发送失败: {e}")
+        logger.info(f"[YunzaiAdapter] 通过 send_message 发送回复: {len(astrbot_msgs)} 条消息")
+        await self.context.send_message(session, astrbot_chain)
 
     async def _convert_to_yunzai_msgs(self, event: AstrMessageEvent) -> list:
         """AstrBot 消息链 → Yunzai 消息格式"""
@@ -362,10 +393,19 @@ class YunzaiAdapter(Star):
             elif img_data.startswith("http"):
                 return Image.fromURL(img_data)
             else:
-                # 尝试作为本地路径
-                path = Path(img_data)
+                # 处理 file:// 协议前缀（Yunzai 本地图片常见格式）
+                raw_path = img_data
+                if raw_path.startswith("file://"):
+                    raw_path = raw_path[7:]  # 去掉 file:// 前缀
+
+                # 尝试作为本地路径解析（支持绝对路径和相对路径）
+                path = Path(raw_path)
+                if not path.is_absolute() and self.yunzai_root:
+                    # 相对路径且配置了 Yunzai 根目录，拼接为绝对路径
+                    path = Path(self.yunzai_root) / path
+
                 if path.exists():
-                    return Image.fromFileSystem(str(path))
+                    return Image.fromFileSystem(str(path.resolve()))
                 logger.warning(f"[YunzaiAdapter] 无法识别的图片数据: {img_data[:50]}...")
                 return None
         except Exception as e:
