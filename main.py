@@ -49,7 +49,7 @@ class YunzaiAdapter(Star):
                 return self.config.get(key, default)
             return getattr(self.config, key, default) if self.config else default
 
-        self.ws_host = _get("WS_HOST", "127.0.0.1")
+        self.ws_host = _get("WS_HOST", "yunzai")
         self.ws_port = _get("WS_PORT", 8766)
         prefixes = _get("YUNZAI_ONLY_PREFIXES", [])
         self.yunzai_only_prefixes = [

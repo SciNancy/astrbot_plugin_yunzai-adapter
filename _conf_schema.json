@@ -2,7 +2,7 @@
     "WS_HOST": {
         "description": "Yunzai WebSocket 服务器地址",
         "type": "string",
-        "default": "127.0.0.1"
+        "default": "yunzai"
     },
     "WS_PORT": {
         "description": "Yunzai WebSocket 服务器端口",
@@ -15,5 +15,11 @@
         "type": "list",
         "default": [],
         "hint": "例如 [#, *] 表示只有 # 或 * 开头的消息才转发给 Yunzai"
+    },
+    "YUNZAI_ROOT": {
+        "description": "Yunzai-Bot 根目录绝对路径，用于解析相对路径的图片",
+        "type": "string",
+        "default": "",
+        "hint": "Yunzai 生成的图片路径如 ./temp/xxx.jpg，需配置此路径才能正确读取。例如 /root/Miao-Yunzai"
     }
 }
