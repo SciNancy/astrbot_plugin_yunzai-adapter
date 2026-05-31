@@ -189,13 +189,14 @@ class YunzaiAdapter(Star):
                 self.pending_futures.pop(payload.msg_id, None)
         else:
             # QQ 等持久会话平台：保存事件，异步等待回复
-            # 同时保存 msg_id / user_id / group_id（群聊时 target_id 为 group_id）作为多维度索引
-            self.pending_events[payload.msg_id] = event
+            # msg_id 加前缀避免与 user_id / group_id 的数值冲突（群号可能和 session_id 相同）
+            msg_key = f"msg:{payload.msg_id}"
+            self.pending_events[msg_key] = event
             self.pending_events[user_id] = event
             if is_group and group_id:
                 self.pending_events[group_id] = event
             logger.debug(
-                f"[YunzaiAdapter] pending_events 已保存: msg_id={payload.msg_id}, "
+                f"[YunzaiAdapter] pending_events 已保存: msg_key={msg_key}, "
                 f"user_id={user_id}, group_id={group_id}, keys={list(self.pending_events.keys())}"
             )
 
@@ -268,10 +269,11 @@ class YunzaiAdapter(Star):
         # 2) QQ 等持久会话平台：通过保存的 event 异步发送
         event = None
         matched_key = None
-        if msg_id and msg_id in self.pending_events:
+        msg_key = f"msg:{msg_id}" if msg_id else None
+        if msg_key and msg_key in self.pending_events:
             # msg_id 匹配时不立即 pop，允许同一消息的多条回复
-            event = self.pending_events[msg_id]
-            matched_key = f"msg_id={msg_id}"
+            event = self.pending_events[msg_key]
+            matched_key = msg_key
         elif target_id in self.pending_events:
             event = self.pending_events.pop(target_id)
             matched_key = f"target_id={target_id}"
@@ -285,15 +287,14 @@ class YunzaiAdapter(Star):
                 await event.send(astrbot_chain)
             except Exception as e:
                 logger.error(f"[YunzaiAdapter] event.send() 失败: {e}")
-            # 清理 target_id 对应的索引（不影响 msg_id 的多条回复窗口）
+            # 清理 target_id / user_id / group_id 索引，但绝不触碰 msg_key
             self.pending_events.pop(target_id, None)
-            # 同时也清理 user_id 索引，避免同一用户新消息被旧回复误匹配
             user_id = data.get("user_id")
             if user_id:
                 self.pending_events.pop(user_id, None)
-            # msg_id 延迟清理以支持后续回复
-            if msg_id and msg_id in self.pending_events:
-                asyncio.get_event_loop().call_later(60, self._safe_pop_pending, msg_id)
+            # msg_key 延迟 60 秒清理，给 Yunzai 的多条回复留时间窗口
+            if msg_key and msg_key in self.pending_events:
+                asyncio.get_event_loop().call_later(60, self._safe_pop_pending, msg_key)
             return
 
         # 3) Fallback: 通过 MessageSesion 发送（适用于其他持久会话平台）
