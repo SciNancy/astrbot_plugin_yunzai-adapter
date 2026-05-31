@@ -56,7 +56,7 @@ class YunzaiAdapter(Star):
             prefix for prefix in (prefixes or [])
             if isinstance(prefix, str) and prefix
         ]
-        self.yunzai_root = (_get("YUNZAI_ROOT", "") or "")
+        self.yunzai_root = (_get("YUNZAI_ROOT", "/AstrBot/yunzai") or "/AstrBot/yunzai")
         self.ws = None
         self.recv_task = None
         # 保存等待 Yunzai 回复的原始事件对象（QQ 等持久会话平台异步回复用）
@@ -189,8 +189,15 @@ class YunzaiAdapter(Star):
                 self.pending_futures.pop(payload.msg_id, None)
         else:
             # QQ 等持久会话平台：保存事件，异步等待回复
+            # 同时保存 msg_id / user_id / group_id（群聊时 target_id 为 group_id）作为多维度索引
             self.pending_events[payload.msg_id] = event
             self.pending_events[user_id] = event
+            if is_group and group_id:
+                self.pending_events[group_id] = event
+            logger.debug(
+                f"[YunzaiAdapter] pending_events 已保存: msg_id={payload.msg_id}, "
+                f"user_id={user_id}, group_id={group_id}, keys={list(self.pending_events.keys())}"
+            )
 
         # 独占前缀消息阻断 AstrBot 后续处理（LLM 等）
         if self._is_yunzai_only_message(event):
@@ -241,6 +248,11 @@ class YunzaiAdapter(Star):
             logger.warning("[YunzaiAdapter] 回复缺少 target_id")
             return
 
+        logger.debug(
+            f"[YunzaiAdapter] 收到回复: msg_id={msg_id}, target_id={target_id}, "
+            f"target_type={target_type}, pending_keys={list(self.pending_events.keys())}"
+        )
+
         # 转换消息为 AstrBot 格式
         astrbot_chain = MessageChain()
         astrbot_msgs = await self._convert_from_yunzai_msgs(content)
@@ -255,22 +267,32 @@ class YunzaiAdapter(Star):
 
         # 2) QQ 等持久会话平台：通过保存的 event 异步发送
         event = None
+        matched_key = None
         if msg_id and msg_id in self.pending_events:
-            # msg_id 匹配时不立即 pop，允许同一消息的多条回复（如签到中的"签到中..."+图片+撤回）
+            # msg_id 匹配时不立即 pop，允许同一消息的多条回复
             event = self.pending_events[msg_id]
+            matched_key = f"msg_id={msg_id}"
         elif target_id in self.pending_events:
             event = self.pending_events.pop(target_id)
+            matched_key = f"target_id={target_id}"
 
         if event:
-            logger.info(f"[YunzaiAdapter] 通过 event.send() 发送回复: {len(astrbot_msgs)} 条消息")
+            logger.info(
+                f"[YunzaiAdapter] 通过 event.send() 发送回复: {len(astrbot_msgs)} 条消息, "
+                f"匹配方式=({matched_key})"
+            )
             try:
                 await event.send(astrbot_chain)
             except Exception as e:
                 logger.error(f"[YunzaiAdapter] event.send() 失败: {e}")
-            # 只清理 target_id，msg_id 延迟清理以支持后续回复
+            # 清理 target_id 对应的索引（不影响 msg_id 的多条回复窗口）
             self.pending_events.pop(target_id, None)
+            # 同时也清理 user_id 索引，避免同一用户新消息被旧回复误匹配
+            user_id = data.get("user_id")
+            if user_id:
+                self.pending_events.pop(user_id, None)
+            # msg_id 延迟清理以支持后续回复
             if msg_id and msg_id in self.pending_events:
-                # 延迟 60 秒后清理 msg_id，给 Yunzai 的多条回复留时间窗口
                 asyncio.get_event_loop().call_later(60, self._safe_pop_pending, msg_id)
             return
 
@@ -281,7 +303,10 @@ class YunzaiAdapter(Star):
             else MessageType.FRIEND_MESSAGE
         )
         session = MessageSesion(bot_self_id, msg_type_enum, target_id)
-        logger.info(f"[YunzaiAdapter] 通过 send_message 发送回复: {len(astrbot_msgs)} 条消息")
+        logger.warning(
+            f"[YunzaiAdapter] 未找到匹配的 event，通过 send_message fallback 发送: "
+            f"{len(astrbot_msgs)} 条消息, target_id={target_id}, msg_id={msg_id}"
+        )
         await self.context.send_message(session, astrbot_chain)
 
     async def _convert_to_yunzai_msgs(self, event: AstrMessageEvent) -> list:
@@ -397,6 +422,10 @@ class YunzaiAdapter(Star):
                 raw_path = img_data
                 if raw_path.startswith("file://"):
                     raw_path = raw_path[7:]  # 去掉 file:// 前缀
+
+                # 去掉 ./ 前缀，避免拼接后产生冗余的当前目录标记
+                if raw_path.startswith("./"):
+                    raw_path = raw_path[2:]
 
                 # 尝试作为本地路径解析（支持绝对路径和相对路径）
                 path = Path(raw_path)
